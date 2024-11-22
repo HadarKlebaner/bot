@@ -1,0 +1,280 @@
+import time
+import re
+import telebot
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from concurrent.futures import ThreadPoolExecutor
+from webdriver_manager.chrome import ChromeDriverManager
+from fuzzywuzzy import fuzz
+
+
+# Telegram bot setup
+TELEGRAM_TOKEN = '7901519873:AAGr4hDAlcleNhauPnA5SyzLCfA-uqDkjzE'
+CHAT_ID = '1897244392'
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+# Facebook login credentials
+FB_EMAIL = '0526692966'
+FB_PASSWORD = 'dan1902@'
+
+# Keywords for search
+KEYWORDS = ["2 חדרים", "3 חדרים"]
+NEGATIVE_KEYWORDS = ["לא רלוונטי"]
+
+# Define how far back to search (e.g., last 1 hour)
+SEARCH_TIMEFRAME_SECONDS = 3600  # 1 hour
+
+# Initialize WebDriver options
+options = webdriver.ChromeOptions()
+options.add_argument("--start-maximized")
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
+options.add_argument("--disable-blink-features=AutomationControlled")
+options.add_argument("--disable-gpu")
+options.add_argument("--headless")
+options.add_argument("--disable-logging")
+options.add_argument("--log-level=3")
+driver_service = Service(ChromeDriverManager().install())
+options = webdriver.ChromeOptions()
+options.add_argument("--headless")  # Run in headless mode for better performance
+driver = webdriver.Chrome(service=driver_service, options=options)
+driver.set_page_load_timeout(30)  # Ensure a reasonable timeout
+driver.implicitly_wait(10)       # Add implicit waits for stability
+
+import random
+
+def random_delay():
+    """Introduce random delays to simulate human behavior."""
+    time.sleep(random.uniform(2, 5))
+
+def retry_with_delay(func, retries=3, delay=5, *args, **kwargs):
+    """Retry a function with a delay for handling transient issues."""
+    for attempt in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            time.sleep(delay)
+    raise Exception(f"Function failed after {retries} attempts")
+
+
+def send_telegram_notification(rooms, location, renovated, agency, price, post_url):
+    """Send a message to the Telegram chat with the post details and link."""
+    message = (
+        f"*מודעה חדשה נמצאה:*\n"
+        f"*מספר חדרים:* {rooms}\n"
+        f"*מיקום:* {location}\n"
+        f"*משופצת:* {renovated}\n"
+        f"*תיווך:* {agency}\n"
+        f"*מחיר:* {price}\n"
+        f"*קישור:* {post_url}"
+    )
+    bot.send_message(CHAT_ID, message, parse_mode="Markdown")
+
+
+def setup_driver():
+    """Set up a new WebDriver instance."""
+    driver = webdriver.Chrome(service=driver_service, options=options)
+    driver.set_page_load_timeout(30)
+    driver.implicitly_wait(10)
+    return driver
+
+
+def facebook_login(driver):
+    """Log into Facebook using credentials."""
+    try:
+        driver.get("https://www.facebook.com")
+        email_field = WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "email")))
+        password_field = driver.find_element(By.ID, "pass")
+        email_field.send_keys(FB_EMAIL)
+        password_field.send_keys(FB_PASSWORD)
+        password_field.send_keys(Keys.RETURN)
+        print("Logged into Facebook successfully.")
+        time.sleep(5)
+    except TimeoutException:
+        print("Failed to log into Facebook. Retrying...")
+        facebook_login(driver)
+    except Exception as e:
+        print(f"שגיאה בזמן כניסה לפייסבוק: {e}")
+        driver.quit()
+
+
+def parse_post(post_text):
+    """Extract details from the post text."""
+    rooms = "לא כתוב"
+    location = "לא כתוב"
+    renovated = "לא כתוב"
+    agency = "לא"
+    price = "לא כתוב"
+
+    # Extract number of rooms
+    match = re.search(r"\b(\d+)\s*חדר(?:ים)?\b", post_text)
+    if match:
+        rooms = match.group(1)
+
+    # Extract location
+    location_match = re.search(r"(מיקום:.*|רחוב:.*)", post_text)
+    if location_match:
+        location = location_match.group(0).split(":")[1].strip()
+
+    # Determine if renovated
+    if "משופצת" in post_text:
+        renovated = "כן"
+    elif "לא משופצת" in post_text:
+        renovated = "לא"
+
+    # Check for agency mention
+    if "סוכנות" in post_text or "מתווך" in post_text:
+        agency = "כן"
+
+    # Extract price
+    price_match = re.search(r"(\d[\d,\.]+)\s*ש\"?ח\b", post_text)
+    if price_match:
+        price = price_match.group(1)
+
+    return rooms, location, renovated, agency, price
+
+
+def get_post_url(post):
+    """Extract the post URL."""
+    try:
+        return post.find_element(By.TAG_NAME, 'a').get_attribute('href')
+    except NoSuchElementException:
+        try:
+            return post.find_element(By.XPATH, ".//a[contains(@href, '/posts/')]").get_attribute('href')
+        except NoSuchElementException:
+            return "לא נמצא קישור"
+
+def scroll_to_bottom(driver):
+    """Scroll to the bottom of the page to load more posts."""
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    retries = 5  # Allow a maximum of 5 retries
+    while retries > 0:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)  # Wait for new content to load
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:  # Break if no new content is loaded
+            retries -= 1
+        else:
+            retries = 5  # Reset retries if new content is loaded
+        last_height = new_height
+
+def scroll_with_variation(driver):
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    while True:
+        driver.execute_script(f"window.scrollBy(0, {random.randint(500, 1500)});")
+        time.sleep(random.uniform(1.5, 3.5))
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:  # Break if no new content is loaded
+            break
+        last_height = new_height
+
+
+def safe_find_element(driver, by, value, retries=3):
+    for attempt in range(retries):
+        try:
+            return driver.find_element(by, value)
+        except NoSuchElementException:
+            time.sleep(2)  # Wait and retry
+    raise NoSuchElementException(f"Element not found: {value}")
+
+
+def match_hebrew_keywords(post_text, keywords):
+    return match_keywords_fuzzy(post_text, keywords)
+
+def match_keywords_fuzzy(post_text, keywords, threshold=80):
+    return any(fuzz.partial_ratio(post_text, keyword) >= threshold for keyword in keywords)
+
+
+def check_group_for_keywords(group_url, last_checked_time):
+    """Check Facebook group posts for specified Hebrew keywords."""
+    driver = setup_driver()
+    facebook_login(driver)
+    try:
+        print(f"Checking group: {group_url}")
+        driver.get(group_url)
+        random_delay()
+
+        # Scroll to fetch more posts
+        scroll_with_variation(driver)
+
+        # Fetch posts
+        posts = retry_with_delay(
+            WebDriverWait(driver, 30).until,
+            EC.presence_of_all_elements_located((By.XPATH, "//div[@role='feed']/div"))
+        )
+        print(f"Found {len(posts)} posts in the group.")
+
+        for index, post in enumerate(posts):
+            try:
+                print(f"Processing post {index + 1} of {len(posts)} in group {group_url}.")
+                random_delay()
+
+                # Expand "See More" if present
+                try:
+                    safe_find_element(post, By.XPATH, ".//div[contains(@class, 'post-text-class')]")
+                    see_more.click()
+                    time.sleep(1)
+                except NoSuchElementException:
+                    pass
+
+                # Fetch full post text
+                post_text = retry_with_delay(
+                    post.find_element,
+                    By.XPATH,
+                    ".//div[contains(@class, 'post-text-class')]"
+                ).text.strip()
+                print(f"Full Post Text: {post_text[:500]}")
+
+                # Match keywords
+                if match_hebrew_keywords(post_text, KEYWORDS):
+                    print(f"Keyword matched: {[kw for kw in KEYWORDS if kw in post_text]}")
+                else:
+                    continue
+
+                # Validate timestamp
+                try:
+                    post_time_element = WebDriverWait(post, 5).until(
+                        EC.presence_of_element_located((By.XPATH, ".//abbr"))
+                    )
+                    post_time = post_time_element.get_attribute("data-utime")
+                    if int(post_time) < last_checked_time:
+                        continue
+                except Exception:
+                    continue
+
+                # Parse and send notifications
+                rooms, location, renovated, agency, price = parse_post(post_text)
+                post_url = get_post_url(post)
+                send_telegram_notification(rooms, location, renovated, agency, price, post_url)
+
+            except Exception as e:
+                print(f"Error processing post: {e}")
+
+    except Exception as e:
+        print(f"Error checking group {group_url}: {e}")
+    finally:
+        driver.quit()
+
+
+
+def main():
+    """Main function to log into Facebook and continuously check groups for keywords."""
+    group_urls = [
+        "https://www.facebook.com/groups/101875683484689",
+        "https://www.facebook.com/groups/305724686290054",
+    ]
+
+    last_checked_time = int(time.time()) - SEARCH_TIMEFRAME_SECONDS
+
+    with ThreadPoolExecutor(max_workers=len(group_urls)) as executor:
+        executor.map(lambda url: check_group_for_keywords(url, last_checked_time), group_urls)
+
+
+if __name__ == "__main__":
+    main()
